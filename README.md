@@ -2,7 +2,7 @@
 
 **bihs** differs from hotstuff in two aspects:
 
-1. the votes are splitted into views like pbft
+1. the votes are splitted into `(height, view)` like pbft
 2. the possible block for each height is bivalent, either the one proposed by current leader(which can be calculated after the confirmation of the previous block), or a deterministic empty block.
 
 So **bihs** doesn't have the requirement to know leader for future block, it's as safe as pbft, while the complexity is still `O(n)`.

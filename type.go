@@ -3,6 +3,7 @@ package bihs
 import (
 	"crypto/sha256"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/ontio/ontology/common"
@@ -14,38 +15,55 @@ type MsgType uint8
 
 const (
 	MTPrepare MsgType = iota + 1
-	MTPreCommit
 	MTCommit
+	MTDecide
 	MTNewView
+	MTReqBlock
+	MTRespBlock
+)
+
+type PendingStep uint8
+
+const (
+	PSNone PendingStep = iota + 1
+	PSPrepare
+	PSDecide
 )
 
 type Serializable interface {
-	Serialize(sink *common.ZeroCopySink) error
+	Serialize(sink *common.ZeroCopySink)
 	Deserialize(source *common.ZeroCopySource) error
 }
 
 type Msg struct {
 	Type       MsgType
-	Node       *Node
 	Height     uint64
 	View       uint64
+	Justify    *QC
+	Node       *BlockOrHash
+	ID         ID // needed for bls
 	PartialSig []byte
 }
 
 var _ Serializable = (*Msg)(nil)
-var _ Serializable = (*Node)(nil)
+var _ Serializable = (*BlockOrHash)(nil)
 var _ Serializable = (*QC)(nil)
+var _ Serializable = (*ConsensusState)(nil)
 
-func (m *Msg) Serialize(sink *common.ZeroCopySink) (err error) {
+func (m *Msg) Serialize(sink *common.ZeroCopySink) {
 	sink.WriteByte(byte(m.Type))
-	if m.Node == nil {
-		err = fmt.Errorf("Msg.Serialize Node empty")
-		return
-	}
-	m.Node.Serialize(sink)
+	sink.WriteUint64(m.Height)
 	sink.WriteUint64(m.View)
+	sink.WriteBool(m.Justify != nil)
+
+	if m.Justify != nil {
+		m.Justify.Serialize(sink)
+	}
+
+	m.Node.Serialize(sink)
+
+	sink.WriteVarBytes(m.ID)
 	sink.WriteVarBytes(m.PartialSig)
-	return
 }
 
 func (m *Msg) Deserialize(source *common.ZeroCopySource) (err error) {
@@ -56,24 +74,58 @@ func (m *Msg) Deserialize(source *common.ZeroCopySource) (err error) {
 	}
 
 	m.Type = MsgType(t)
-
-	m.Node = &Node{}
-	err = m.Node.Deserialize(source)
-	if err != nil {
+	m.Height, eof = source.NextUint64()
+	if eof {
+		err = fmt.Errorf("Msg.Deserialize Height EOF")
 		return
 	}
-
 	m.View, eof = source.NextUint64()
 	if eof {
 		err = fmt.Errorf("Msg.Deserialize View EOF")
 		return
 	}
 
+	isQC, ir, eof := source.NextBool()
+	if ir || eof {
+		err = fmt.Errorf("Msg.Deserialize isQC EOF")
+		return
+	}
+	if isQC {
+		m.Justify = &QC{}
+		err = m.Justify.Deserialize(source)
+		if err != nil {
+			err = fmt.Errorf("Msg.Justify.Deserialize fail:%v", err)
+			return
+		}
+		m.Node = &BlockOrHash{Hash: m.Justify.BlockHash}
+	} else {
+		m.Node = &BlockOrHash{}
+		err = m.Node.Deserialize(source)
+		if err != nil {
+			return
+		}
+	}
+
+	m.ID, err = source.ReadVarBytes()
+	if err != nil {
+		err = fmt.Errorf("Msg.Deserialize ID:%v", err)
+		return
+	}
+
 	m.PartialSig, err = source.ReadVarBytes()
 	if err != nil {
 		err = fmt.Errorf("Msg.Deserialize PartialSig:%v", err)
+		return
 	}
+
 	return
+}
+
+func (m *Msg) BlockHash() []byte {
+	if m.Justify != nil {
+		return m.Justify.BlockHash
+	}
+	return m.Node.BlockHash()
 }
 
 func (m *Msg) Hash() []byte {
@@ -81,7 +133,7 @@ func (m *Msg) Hash() []byte {
 	sink.WriteByte(byte(m.Type))
 	sink.WriteUint64(m.Height)
 	sink.WriteUint64(m.View)
-	sink.WriteVarBytes(m.Node.BlockHash())
+	sink.WriteVarBytes(m.BlockHash())
 
 	hash := sha256.Sum256(sink.Bytes())
 	return hash[:]
@@ -102,22 +154,21 @@ type Block interface {
 }
 
 type QC struct {
-	Type MsgType
-	Node *Node
-	View uint64
-	Sigs []byte
+	Type      MsgType
+	Height    uint64
+	View      uint64
+	BlockHash []byte
+	Sigs      []byte
+	Bitmap    []byte // needed for bls
 }
 
-func (qc *QC) Serialize(sink *common.ZeroCopySink) (err error) {
+func (qc *QC) Serialize(sink *common.ZeroCopySink) {
 	sink.WriteByte(byte(qc.Type))
-	if qc.Node == nil {
-		err = fmt.Errorf("QC.Serialize Node empty")
-		return
-	}
-	qc.Node.Serialize(sink)
+	sink.WriteUint64(qc.Height)
 	sink.WriteUint64(qc.View)
+	sink.WriteVarBytes(qc.BlockHash)
 	sink.WriteVarBytes(qc.Sigs)
-	return
+	sink.WriteVarBytes(qc.Bitmap)
 }
 
 func (qc *QC) Deserialize(source *common.ZeroCopySource) (err error) {
@@ -128,22 +179,30 @@ func (qc *QC) Deserialize(source *common.ZeroCopySource) (err error) {
 	}
 
 	qc.Type = MsgType(t)
-	qc.Node = &Node{}
-	err = qc.Node.Deserialize(source)
-	if err != nil {
-		err = fmt.Errorf("QC.Deserialize Node invalid:%v", err)
+	qc.Height, eof = source.NextUint64()
+	if eof {
+		err = fmt.Errorf("QC.Deserialize Height EOF")
 		return
 	}
-
 	qc.View, eof = source.NextUint64()
 	if eof {
 		err = fmt.Errorf("QC.Deserialize View EOF")
 		return
 	}
-
+	qc.BlockHash, err = source.ReadVarBytes()
+	if err != nil {
+		err = fmt.Errorf("QC.Deserialize BlockHash invalid:%v", err)
+		return
+	}
 	qc.Sigs, err = source.ReadVarBytes()
 	if err != nil {
 		err = fmt.Errorf("QC.Deserialize Sigs invalid:%v", err)
+		return
+	}
+
+	qc.Bitmap, err = source.ReadVarBytes()
+	if err != nil {
+		err = fmt.Errorf("QC.Deserialize Bitmap invalid:%v", err)
 		return
 	}
 
@@ -151,143 +210,101 @@ func (qc *QC) Deserialize(source *common.ZeroCopySource) (err error) {
 }
 
 func (qc *QC) Validate(hs *HotStuff) error {
-	switch qc.Type {
-	case MTPrepare:
-		hs.conf.TVerify((&Msg{Type: qc.Type, View: qc.View, Node: qc.Node}).Hash(), qc.Sigs, quorum(hs.conf.ValidatorCount(qc.Node.Height())))
-	case MTPreCommit:
-		hs.conf.TVerify((&Msg{Type: qc.Type, View: qc.View, Node: qc.Node}).Hash(), qc.Sigs, quorum(hs.conf.ValidatorCount(qc.Node.Height())))
-	default:
-		return fmt.Errorf("invalid type(%d) for qc", qc.Type)
-	}
-	return nil
+	return hs.validateQC(qc)
 }
 
-// TODO Blk can be empty when embeded in a QC
-type BlockPayload struct {
+type BlockOrHash struct {
 	Blk  Block
 	Hash []byte
 }
 
-type Node struct {
-	Blk     Block
-	Justify *QC
-}
-
-func (n *Node) Serialize(sink *common.ZeroCopySink) (err error) {
-	if n.Blk != nil {
-		sink.WriteBool(true)
-		err = n.Blk.Serialize(sink)
+func (boh *BlockOrHash) Serialize(sink *common.ZeroCopySink) {
+	sink.WriteBool(boh.Blk != nil)
+	if boh.Blk != nil {
+		boh.Blk.Serialize(sink)
 	} else {
-		sink.WriteBool(false)
-		if n.Justify == nil {
-			sink.WriteBool(false)
-			return
-		} else {
-			sink.WriteBool(true)
-		}
-		err = n.Justify.Serialize(sink)
-
+		sink.WriteVarBytes(boh.Hash)
 	}
-
-	return
 }
 
-func (n *Node) Deserialize(source *common.ZeroCopySource) (err error) {
-	b, irregular, eof := source.NextBool()
-	if irregular || eof {
-		err = fmt.Errorf("Node.Deserialize irregular:%v eof:%v", irregular, eof)
-		return
+func (boh *BlockOrHash) Deserialize(source *common.ZeroCopySource) error {
+	isBlk, ir, eof := source.NextBool()
+	if ir || eof {
+		return fmt.Errorf("BlockOrHash.Deserialize ir:%v eof:%v", ir, eof)
 	}
-	if b {
-		n.Blk = n.Blk.Default()
-		err = n.Blk.Deserialize(source)
-	} else {
-		b, irregular, eof = source.NextBool()
-		if irregular || eof {
-			err = fmt.Errorf("Node.Deserialize irregular:%v eof:%v", irregular, eof)
-			return
-		}
-		if !b {
-			return
-		}
-		n.Justify = &QC{}
-		err = n.Justify.Deserialize(source)
+	if isBlk {
+		boh.Blk = boh.Blk.Default()
+		return boh.Blk.Deserialize(source)
 	}
 
-	return
+	boh.Hash, _, ir, eof = source.NextVarBytes()
+	if ir || eof {
+		return fmt.Errorf("BlockOrHash.Deserialize ir:%v eof:%v", ir, eof)
+	}
+
+	return nil
 }
 
-func (n *Node) Validate(hs *HotStuff) error {
-	if n.Blk != nil {
-		return n.Blk.Validate()
+func (boh *BlockOrHash) BlockHash() []byte {
+	if boh.Hash != nil {
+		return boh.Hash
 	}
 
-	if n.Justify == nil {
-		return nil
-	}
-
-	return n.Justify.Validate(hs)
-}
-
-func (n *Node) BlockHash() []byte {
-	if n.Blk != nil {
-		return n.Blk.Hash()
-	}
-
-	if n.Justify == nil {
-		return nil
-	}
-	return n.Justify.Node.BlockHash()
-}
-
-func (n *Node) Height() uint64 {
-	if n.Blk != nil {
-		return n.Blk.Height()
-	}
-
-	return n.Justify.Node.Height()
-}
-
-func (n *Node) Block() Block {
-	if n.Blk != nil {
-		return n.Blk
-	}
-
-	return n.Justify.Node.Block()
+	return boh.Blk.Hash()
 }
 
 type StateDB interface {
 	GetBlock(n uint64) Block
 	StoreBlock(blk Block, lockQc, commitQC *QC) error
-	StoreVoted(voted uint64) error
-	GetVoted() int64 // initial(empty) value should be -1
-	ClearVoted()
 	Height() uint64
 	IsBlockProposableBy(Block, ID) bool
+}
+
+type EcSigner interface {
+	Sign(data []byte) []byte
+	Verify(data []byte, sig []byte) (ID, error)
+	TCombine(data []byte, sigs [][]byte) []byte
+	TVerify(data []byte, sigs []byte, quorum int32) bool
+}
+
+type BlsSigner interface {
+	Sign(data []byte) []byte
+	Verify(data []byte, ID, sig []byte) error
+	PK(ID) interface{}
+	TCombine(data []byte, pks interface{}, sigs [][]byte) []byte
+	TVerify(data []byte, pks interface{}, sigs []byte) bool
+}
+
+type StateSyncer interface {
+	SyncWithPeer(ID, uint64)
 }
 
 type Config struct {
 	BlockInterval     time.Duration
 	SyncCheckInterval time.Duration
 	ProposerID        ID
+	WalPath           string
 
-	IsValidator    func(height uint64, peer ID) bool
+	ValidatorIndex func(height uint64, peer ID) int
 	SelectLeader   func(height, view uint64) ID
 	EmptyBlock     func(height uint64) Block
 	ValidatorCount func(height uint64) int32
-	Sign           func(data []byte) []byte
-	Verify         func(data []byte, sig []byte) (ID, error)
-	TCombine       func(data []byte, sigs [][]byte) []byte
-	TVerify        func(data []byte, sigs []byte, quorum int32) bool
-	Logger         Logger
+
+	// used together with BlsSigner
+	PKs func(height uint64, bitmap []byte) interface{}
+
+	EcSigner  EcSigner
+	BlsSigner BlsSigner
+	Syncer    StateSyncer
+	Logger    Logger
 }
 
 func (config *Config) validate() error {
 	if config.ProposerID == nil {
 		return fmt.Errorf("Config.ProposerID is nil")
 	}
-	if config.IsValidator == nil {
-		return fmt.Errorf("Config.IsValidator is nil")
+	if config.ValidatorIndex == nil {
+		return fmt.Errorf("Config.ValidatorIndex is nil")
 	}
 	if config.SelectLeader == nil {
 		return fmt.Errorf("Config.SelectLeader is nil")
@@ -298,23 +315,99 @@ func (config *Config) validate() error {
 	if config.ValidatorCount == nil {
 		return fmt.Errorf("Config.ValidatorCount is nil")
 	}
-	if config.Sign == nil {
-		return fmt.Errorf("Config.Sign is nil")
+	if config.EcSigner == nil && config.BlsSigner == nil {
+		return fmt.Errorf("both Config.EcSigner and Config.BlsSigner are nil")
 	}
-	if config.Verify == nil {
-		return fmt.Errorf("Config.Verify is nil")
+	if config.WalPath == "" {
+		config.WalPath = "./wal"
 	}
-	if config.TCombine == nil {
-		return fmt.Errorf("Config.TCombine is nil")
-	}
-	if config.TVerify == nil {
-		return fmt.Errorf("Config.TVerify is nil")
+	err := os.MkdirAll(config.WalPath, 0777)
+	if err != nil {
+		return err
 	}
 	if config.Logger == nil {
 		config.Logger = defaultLogger()
 	}
 
 	return nil
+}
+
+type ConsensusState struct {
+	Height       uint64
+	View         uint64
+	CandidateBlk Block
+	LockQC       *QC
+	HasVoted     bool
+}
+
+func (cs *ConsensusState) Serialize(sink *common.ZeroCopySink) {
+	sink.WriteUint64(cs.Height)
+	sink.WriteUint64(cs.View)
+	sink.WriteBool(cs.CandidateBlk != nil)
+	if cs.CandidateBlk != nil {
+		cs.CandidateBlk.Serialize(sink)
+	}
+	sink.WriteBool(cs.LockQC != nil)
+	if cs.LockQC != nil {
+		cs.LockQC.Serialize(sink)
+	}
+	sink.WriteBool(cs.HasVoted)
+}
+
+func (cs *ConsensusState) Deserialize(source *common.ZeroCopySource) (err error) {
+	height, eof := source.NextUint64()
+	if eof {
+		err = fmt.Errorf("ConsensusState.Deserialize EOF at Height")
+		return
+	}
+	view, eof := source.NextUint64()
+	if eof {
+		err = fmt.Errorf("ConsensusState.Deserialize EOF at View")
+		return
+	}
+	hasBlk, ir, eof := source.NextBool()
+	if ir || eof {
+		err = fmt.Errorf("ConsensusState.Deserialize EOF at HasBlk")
+		return
+	}
+	if hasBlk {
+		cs.CandidateBlk = cs.CandidateBlk.Default()
+		err = cs.CandidateBlk.Deserialize(source)
+		if err != nil {
+			return
+		}
+	}
+	hasQC, ir, eof := source.NextBool()
+	if ir || eof {
+		err = fmt.Errorf("ConsensusState.Deserialize EOF at HasQC")
+		return
+	}
+	if hasQC {
+		cs.LockQC = &QC{}
+		err = cs.LockQC.Deserialize(source)
+		if err != nil {
+			return
+		}
+	}
+	if hasBlk != hasQC {
+		err = fmt.Errorf("inconsistent consensus state detected: (hasBlk:%v hasQC:%v)", hasBlk, hasQC)
+		return
+	}
+
+	hasVoted, ir, eof := source.NextBool()
+	if ir || eof {
+		err = fmt.Errorf("ConsensusState.Deserialize EOF at HasVoted")
+		return
+	}
+	if hasVoted && cs.CandidateBlk == nil {
+		err = fmt.Errorf("inconsistent consensus state detected: (HasVoted:%v CandidateBlk:nil)", hasVoted)
+		return
+	}
+
+	cs.Height = height
+	cs.View = view
+	cs.HasVoted = hasVoted
+	return
 }
 
 type Logger interface {

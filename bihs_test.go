@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"os"
 	"strconv"
 	"testing"
 	"time"
@@ -29,9 +30,8 @@ func (b HappyBlock) Default() Block {
 	return &hb
 }
 
-func (b *HappyBlock) Serialize(sink *common.ZeroCopySink) error {
+func (b *HappyBlock) Serialize(sink *common.ZeroCopySink) {
 	sink.WriteUint64(uint64(*b))
-	return nil
 }
 func (b *HappyBlock) Deserialize(source *common.ZeroCopySource) error {
 	data, eof := source.NextUint64()
@@ -80,6 +80,7 @@ func (db *HappyDB) GetBlock(n uint64) Block {
 
 	return &db.Blocks[n]
 }
+
 func (db *HappyDB) StoreBlock(blk Block, lockQc, commitQC *QC) error {
 	hp := blk.(*HappyBlock)
 	if hp.Height() != uint64(len(db.Blocks)) {
@@ -132,6 +133,29 @@ func (p *HappyP2P) MsgCh() <-chan *Msg {
 	return p.msgCh
 }
 
+type ecsigner struct {
+	sign     func(data []byte) []byte
+	verify   func(data []byte, sig []byte) (ID, error)
+	tcombine func(data []byte, sigs [][]byte) []byte
+	tVerify  func(data []byte, sigs []byte, quorum int32) bool
+}
+
+func (s *ecsigner) Sign(data []byte) []byte {
+	return s.sign(data)
+}
+
+func (s *ecsigner) Verify(data []byte, sig []byte) (ID, error) {
+	return s.verify(data, sig)
+}
+
+func (s *ecsigner) TCombine(data []byte, sigs [][]byte) []byte {
+	return s.tcombine(data, sigs)
+}
+
+func (s *ecsigner) TVerify(data []byte, sigs []byte, quorum int32) bool {
+	return s.tVerify(data, sigs, quorum)
+}
+
 func TestHappyPath(t *testing.T) {
 	var (
 		dbs  []*HappyDB
@@ -144,16 +168,45 @@ func TestHappyPath(t *testing.T) {
 		db := NewHappyDB(int(totalValidators))
 		p2p := NewHappyP2P()
 		id := ID([]byte(fmt.Sprintf("%d", i)))
+
+		var signer ecsigner
+		signer.sign = func(data []byte) []byte {
+			clone := make([]byte, len(id))
+			copy(clone, id)
+			return clone
+		}
+		signer.verify = func(data []byte, sig []byte) (ID, error) {
+			return (ID)(sig), nil
+		}
+		signer.tcombine = func(data []byte, sigs [][]byte) []byte {
+			return []byte(fmt.Sprintf("%d", len(sigs)))
+		}
+		signer.tVerify = func(data []byte, sigs []byte, quorum int32) bool {
+			n, err := strconv.ParseUint(string(sigs), 10, 64)
+			if err != nil {
+				return false
+			}
+
+			return n >= uint64(quorum)
+		}
+		walPath := fmt.Sprintf("./wal/%d", i)
+		defer os.RemoveAll(walPath)
+
 		conf := Config{
 			BlockInterval:     time.Second * 3,
 			SyncCheckInterval: time.Second * 3,
 			ProposerID:        id,
-			IsValidator: func(height uint64, peer ID) bool {
+			WalPath:           walPath,
+			ValidatorIndex: func(height uint64, peer ID) int {
 				id, err := strconv.ParseUint(string(peer), 10, 64)
 				if err != nil {
-					return false
+					return -1
 				}
-				return id < totalValidators
+				if id < totalValidators {
+					return int(id)
+				} else {
+					return -1
+				}
 			},
 			SelectLeader: func(height, view uint64) ID {
 				return ID([]byte(fmt.Sprintf("%d", (height+view)%totalValidators)))
@@ -165,25 +218,7 @@ func TestHappyPath(t *testing.T) {
 			ValidatorCount: func(height uint64) int32 {
 				return int32(totalValidators)
 			},
-			Sign: func(data []byte) []byte {
-				clone := make([]byte, len(id))
-				copy(clone, id)
-				return clone
-			},
-			Verify: func(data []byte, sig []byte) (ID, error) {
-				return (ID)(sig), nil
-			},
-			TCombine: func(data []byte, sigs [][]byte) []byte {
-				return []byte(fmt.Sprintf("%d", len(sigs)))
-			},
-			TVerify: func(data []byte, sigs []byte, quorum int32) bool {
-				n, err := strconv.ParseUint(string(sigs), 10, 64)
-				if err != nil {
-					return false
-				}
-
-				return n >= uint64(quorum)
-			},
+			EcSigner: &signer,
 		}
 		hs := New(&genesis, db, p2p, conf)
 		dbs = append(dbs, db)
