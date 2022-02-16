@@ -45,7 +45,7 @@ func (hs *HotStuff) matchingQC(qc *QC, t MsgType, v uint64) bool {
 
 func (hs *HotStuff) isLeader(height, view uint64) bool {
 
-	isLeader := bytes.Equal(hs.conf.ProposerID, hs.conf.SelectLeader(height, view))
+	isLeader := bytes.Equal(hs.conf.ProposerID, hs.store.SelectLeader(height, view))
 
 	return isLeader
 }
@@ -58,8 +58,9 @@ func (hs *HotStuff) validateQCEc(qc *QC) error {
 	switch qc.Type {
 	case MTPrepare:
 		fallthrough
-	case MTCommit:
-		if !hs.conf.EcSigner.TVerify((&Msg{Type: qc.Type, Height: qc.Height, View: qc.View, Node: &BlockOrHash{Hash: qc.BlockHash}}).Hash(), qc.Sigs, quorum(hs.conf.ValidatorCount(qc.Height))) {
+	case MTPreCommit:
+		ids := hs.store.ValidatorIDs(qc.Height)
+		if !hs.conf.EcSigner.TVerify((&Msg{Type: qc.Type, Height: qc.Height, View: qc.View, Node: &BlockOrHash{Hash: qc.BlockHash}}).Hash(), qc.Sigs, ids, quorum(int32(len(ids)))) {
 			return fmt.Errorf("TVerify failed, type %d", qc.Type)
 		}
 	default:
@@ -114,13 +115,13 @@ func (hs *HotStuff) validateQCBls(qc *QC) error {
 	switch qc.Type {
 	case MTPrepare:
 		fallthrough
-	case MTCommit:
+	case MTPreCommit:
 		height := qc.Height
-		q := quorum(hs.conf.ValidatorCount(height))
+		q := quorum(hs.store.ValidatorCount(height))
 		if !hs.bitmapEnough(qc.Bitmap, q) {
 			return fmt.Errorf("not enough validators in bitmap")
 		}
-		pks := hs.conf.PKs(height, qc.Bitmap)
+		pks := hs.store.PKs(height, qc.Bitmap)
 		if !hs.conf.BlsSigner.TVerify((&Msg{Type: qc.Type, Height: qc.Height, View: qc.View, Node: &BlockOrHash{Hash: qc.BlockHash}}).Hash(), pks, qc.Sigs) {
 			return fmt.Errorf("TVerify failed, type %d", qc.Type)
 		}

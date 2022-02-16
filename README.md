@@ -11,7 +11,6 @@ So **bihs** doesn't have the requirement to know leader for future block, it's a
 
 ```golang
 var (
-    genesis Block
     store StateDB
     p2p P2P
     conf Config
@@ -19,11 +18,10 @@ var (
 
 # all you need to do is to provide the implementations for Block/StateDB/P2P interfaces
 
-genesis = ...
 store = ...
 p2p = ...
 
-hs := New(genesis , store , p2p , conf)
+hs := New(store , p2p , conf)
 hs.Start()
 
 # after this, you can propose blocks when it's your turn
@@ -37,4 +35,7 @@ hs.Wait(context.Background(), height)
 
 ## Demo
 
-[Here](https://github.com/zhiqiangxu/bihs/blob/master/bihs_test.go#L135)
+[Here](https://github.com/zhiqiangxu/bihs/blob/master/bihs_test.go#L216)
+
+## `geth` integration
+[Here](https://github.com/zhiqiangxu/go-ethereum/blob/web3q_bihs/start_bihs.md)

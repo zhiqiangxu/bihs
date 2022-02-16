@@ -2,8 +2,10 @@ package bihs
 
 import (
 	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/ontio/ontology/common"
@@ -11,23 +13,25 @@ import (
 
 type ID []byte
 
+func (id ID) String() string {
+	return hex.EncodeToString(id)
+}
+
+type Hash []byte
+
+func (hash Hash) String() string {
+	return hex.EncodeToString(hash)
+}
+
 type MsgType uint8
 
 const (
 	MTPrepare MsgType = iota + 1
+	MTPreCommit
 	MTCommit
-	MTDecide
 	MTNewView
 	MTReqBlock
 	MTRespBlock
-)
-
-type PendingStep uint8
-
-const (
-	PSNone PendingStep = iota + 1
-	PSPrepare
-	PSDecide
 )
 
 type Serializable interface {
@@ -48,7 +52,6 @@ type Msg struct {
 var _ Serializable = (*Msg)(nil)
 var _ Serializable = (*BlockOrHash)(nil)
 var _ Serializable = (*QC)(nil)
-var _ Serializable = (*ConsensusState)(nil)
 
 func (m *Msg) Serialize(sink *common.ZeroCopySink) {
 	sink.WriteByte(byte(m.Type))
@@ -60,7 +63,10 @@ func (m *Msg) Serialize(sink *common.ZeroCopySink) {
 		m.Justify.Serialize(sink)
 	}
 
-	m.Node.Serialize(sink)
+	sink.WriteBool(m.Node != nil)
+	if m.Node != nil {
+		m.Node.Serialize(sink)
+	}
 
 	sink.WriteVarBytes(m.ID)
 	sink.WriteVarBytes(m.PartialSig)
@@ -97,13 +103,28 @@ func (m *Msg) Deserialize(source *common.ZeroCopySource) (err error) {
 			err = fmt.Errorf("Msg.Justify.Deserialize fail:%v", err)
 			return
 		}
-		m.Node = &BlockOrHash{Hash: m.Justify.BlockHash}
-	} else {
-		m.Node = &BlockOrHash{}
+	}
+
+	isNode, ir, eof := source.NextBool()
+	if ir || eof {
+		err = fmt.Errorf("Msg.Deserialize isNode EOF")
+		return
+	}
+
+	m.Node = &BlockOrHash{}
+	if isNode {
 		err = m.Node.Deserialize(source)
 		if err != nil {
+			err = fmt.Errorf("Msg.Node.Deserialize fail:%v", err)
 			return
 		}
+	}
+	if m.Node.Blk == nil && m.Node.Hash == nil && m.Justify != nil {
+		m.Node.Hash = m.Justify.BlockHash
+	}
+	if m.Node.Blk == nil && m.Node.Hash == nil {
+		err = fmt.Errorf("m.Node empty")
+		return
 	}
 
 	m.ID, err = source.ReadVarBytes()
@@ -128,7 +149,7 @@ func (m *Msg) BlockHash() []byte {
 	return m.Node.BlockHash()
 }
 
-func (m *Msg) Hash() []byte {
+func (m *Msg) Hash() Hash {
 	sink := common.NewZeroCopySink(nil)
 	sink.WriteByte(byte(m.Type))
 	sink.WriteUint64(m.Height)
@@ -136,7 +157,7 @@ func (m *Msg) Hash() []byte {
 	sink.WriteVarBytes(m.BlockHash())
 
 	hash := sha256.Sum256(sink.Bytes())
-	return hash[:]
+	return Hash(hash[:])
 }
 
 type P2P interface {
@@ -145,19 +166,23 @@ type P2P interface {
 	MsgCh() <-chan *Msg
 }
 
+type BlockWithTime interface {
+	Block
+	TimeMil() uint64
+}
+
 type Block interface {
 	Serializable
-	Default() Block
-	Validate() error
 	Height() uint64
-	Hash() []byte
+	Hash() Hash
+	Empty() bool
 }
 
 type QC struct {
 	Type      MsgType
 	Height    uint64
 	View      uint64
-	BlockHash []byte
+	BlockHash Hash
 	Sigs      []byte
 	Bitmap    []byte // needed for bls
 }
@@ -209,13 +234,50 @@ func (qc *QC) Deserialize(source *common.ZeroCopySource) (err error) {
 	return
 }
 
-func (qc *QC) Validate(hs *HotStuff) error {
+func (qc *QC) SerializeForHeader(sink *common.ZeroCopySink) {
+
+	sink.WriteUint64(qc.View)
+	sink.WriteVarBytes(qc.Sigs)
+	sink.WriteVarBytes(qc.Bitmap)
+}
+
+func (qc *QC) DeserializeFromHeader(height uint64, blockHash []byte, source *common.ZeroCopySource) (err error) {
+	view, eof := source.NextUint64()
+	if eof {
+		err = fmt.Errorf("QC.DeserializeFromHeader View EOF")
+		return
+	}
+	qc.View = view
+
+	qc.Sigs, err = source.ReadVarBytes()
+	if err != nil {
+		err = fmt.Errorf("QC.DeserializeFromHeader Sigs invalid:%v", err)
+		return
+	}
+
+	qc.Bitmap, err = source.ReadVarBytes()
+	if err != nil {
+		err = fmt.Errorf("QC.DeserializeFromHeader Bitmap invalid:%v", err)
+		return
+	}
+
+	qc.Type = MTPreCommit
+	qc.Height = height
+	qc.BlockHash = blockHash
+	return
+}
+
+func (qc *QC) VerifyEC(signer EcSigner, ids []ID) bool {
+	return signer.TVerify((&Msg{Type: qc.Type, Height: qc.Height, View: qc.View, Node: &BlockOrHash{Hash: qc.BlockHash}}).Hash(), qc.Sigs, ids, quorum(int32(len(ids))))
+}
+
+func (qc *QC) validate(hs *HotStuff) error {
 	return hs.validateQC(qc)
 }
 
 type BlockOrHash struct {
 	Blk  Block
-	Hash []byte
+	Hash Hash
 }
 
 func (boh *BlockOrHash) Serialize(sink *common.ZeroCopySink) {
@@ -227,13 +289,15 @@ func (boh *BlockOrHash) Serialize(sink *common.ZeroCopySink) {
 	}
 }
 
+var DefaultBlockFunc func() Block
+
 func (boh *BlockOrHash) Deserialize(source *common.ZeroCopySource) error {
 	isBlk, ir, eof := source.NextBool()
 	if ir || eof {
 		return fmt.Errorf("BlockOrHash.Deserialize ir:%v eof:%v", ir, eof)
 	}
 	if isBlk {
-		boh.Blk = boh.Blk.Default()
+		boh.Blk = DefaultBlockFunc()
 		return boh.Blk.Deserialize(source)
 	}
 
@@ -245,7 +309,7 @@ func (boh *BlockOrHash) Deserialize(source *common.ZeroCopySource) error {
 	return nil
 }
 
-func (boh *BlockOrHash) BlockHash() []byte {
+func (boh *BlockOrHash) BlockHash() Hash {
 	if boh.Hash != nil {
 		return boh.Hash
 	}
@@ -254,17 +318,31 @@ func (boh *BlockOrHash) BlockHash() []byte {
 }
 
 type StateDB interface {
-	GetBlock(n uint64) Block
-	StoreBlock(blk Block, lockQc, commitQC *QC) error
+	StoreBlock(blk Block, commitQC *QC) error
+	Validate(blk Block) error
 	Height() uint64
-	IsBlockProposableBy(Block, ID) bool
+	SubscribeHeightChange(HeightChangeSub)
+	UnSubscribeHeightChange(HeightChangeSub)
+
+	ValidatorIndex(height uint64, peer ID) int
+	SelectLeader(height, view uint64) ID
+	EmptyBlock(height uint64) (Block, error)
+	ValidatorCount(height uint64) int32
+	ValidatorIDs(height uint64) []ID
+
+	// used together with BlsSigner
+	PKs(height uint64, bitmap []byte) interface{}
+}
+
+type HeightChangeSub interface {
+	HeightChanged()
 }
 
 type EcSigner interface {
 	Sign(data []byte) []byte
 	Verify(data []byte, sig []byte) (ID, error)
 	TCombine(data []byte, sigs [][]byte) []byte
-	TVerify(data []byte, sigs []byte, quorum int32) bool
+	TVerify(data []byte, sigs []byte, ids []ID, quorum int32) bool
 }
 
 type BlsSigner interface {
@@ -280,134 +358,233 @@ type StateSyncer interface {
 }
 
 type Config struct {
-	BlockInterval     time.Duration
-	SyncCheckInterval time.Duration
-	ProposerID        ID
-	WalPath           string
+	BlockInterval time.Duration
+	ProposerID    ID
+	DataDir       string
 
-	ValidatorIndex func(height uint64, peer ID) int
-	SelectLeader   func(height, view uint64) ID
-	EmptyBlock     func(height uint64) Block
-	ValidatorCount func(height uint64) int32
-
-	// used together with BlsSigner
-	PKs func(height uint64, bitmap []byte) interface{}
-
-	EcSigner  EcSigner
-	BlsSigner BlsSigner
-	Syncer    StateSyncer
-	Logger    Logger
+	EcSigner         EcSigner
+	BlsSigner        BlsSigner
+	Syncer           StateSyncer
+	Logger           Logger
+	DefaultBlockFunc func() Block
 }
 
 func (config *Config) validate() error {
+	if config.BlockInterval <= 0 {
+		return fmt.Errorf("config.BlockInterval<=0")
+	}
 	if config.ProposerID == nil {
 		return fmt.Errorf("Config.ProposerID is nil")
-	}
-	if config.ValidatorIndex == nil {
-		return fmt.Errorf("Config.ValidatorIndex is nil")
-	}
-	if config.SelectLeader == nil {
-		return fmt.Errorf("Config.SelectLeader is nil")
-	}
-	if config.EmptyBlock == nil {
-		return fmt.Errorf("Config.EmptyBlock is nil")
-	}
-	if config.ValidatorCount == nil {
-		return fmt.Errorf("Config.ValidatorCount is nil")
 	}
 	if config.EcSigner == nil && config.BlsSigner == nil {
 		return fmt.Errorf("both Config.EcSigner and Config.BlsSigner are nil")
 	}
-	if config.WalPath == "" {
-		config.WalPath = "./wal"
+	if config.DataDir == "" {
+		config.DataDir = "./wal"
 	}
-	err := os.MkdirAll(config.WalPath, 0777)
+	err := os.MkdirAll(config.DataDir, 0777)
 	if err != nil {
 		return err
 	}
 	if config.Logger == nil {
 		config.Logger = defaultLogger()
 	}
+	if config.DefaultBlockFunc == nil && DefaultBlockFunc == nil {
+		return fmt.Errorf("DefaultBlock missing")
+	}
+	if config.DefaultBlockFunc != nil {
+		DefaultBlockFunc = config.DefaultBlockFunc
+	}
 
 	return nil
 }
 
 type ConsensusState struct {
-	Height       uint64
-	View         uint64
-	CandidateBlk Block
-	LockQC       *QC
-	HasVoted     bool
+	height          uint64
+	view            uint64
+	candidateBlk    Block
+	lockQC          *QC
+	hasVotedPrepare bool
+	votes1          map[int][]byte
+	votes2          map[int][]byte
+	voted           []ID
+	idx             int
 }
 
 func (cs *ConsensusState) Serialize(sink *common.ZeroCopySink) {
-	sink.WriteUint64(cs.Height)
-	sink.WriteUint64(cs.View)
-	sink.WriteBool(cs.CandidateBlk != nil)
-	if cs.CandidateBlk != nil {
-		cs.CandidateBlk.Serialize(sink)
+	sink.WriteUint64(cs.height)
+	sink.WriteUint64(cs.view)
+	sink.WriteBool(cs.candidateBlk != nil)
+	if cs.candidateBlk != nil {
+		cs.candidateBlk.Serialize(sink)
 	}
-	sink.WriteBool(cs.LockQC != nil)
-	if cs.LockQC != nil {
-		cs.LockQC.Serialize(sink)
+	sink.WriteBool(cs.lockQC != nil)
+	if cs.lockQC != nil {
+		cs.lockQC.Serialize(sink)
 	}
-	sink.WriteBool(cs.HasVoted)
+	sink.WriteBool(cs.hasVotedPrepare)
+	sink.WriteInt32(int32(len(cs.votes1)))
+	for id, vote := range cs.votes1 {
+		sink.WriteInt64(int64(id))
+		sink.WriteVarBytes(vote)
+	}
+	sink.WriteInt32(int32(len(cs.votes2)))
+	for id, vote := range cs.votes2 {
+		sink.WriteInt64(int64(id))
+		sink.WriteVarBytes(vote)
+	}
+	sink.WriteInt32(int32(len(cs.voted)))
+	for _, id := range cs.voted {
+		sink.WriteVarBytes(id)
+	}
+
+	sink.WriteInt64(int64(cs.idx))
 }
 
 func (cs *ConsensusState) Deserialize(source *common.ZeroCopySource) (err error) {
 	height, eof := source.NextUint64()
 	if eof {
-		err = fmt.Errorf("ConsensusState.Deserialize EOF at Height")
+		err = fmt.Errorf("ConsensusState.Deserialize Height EOF")
 		return
 	}
+	cs.height = height
+
 	view, eof := source.NextUint64()
 	if eof {
-		err = fmt.Errorf("ConsensusState.Deserialize EOF at View")
+		err = fmt.Errorf("ConsensusState.Deserialize View EOF")
 		return
 	}
-	hasBlk, ir, eof := source.NextBool()
+	cs.view = view
+
+	candidateBlk, ir, eof := source.NextBool()
 	if ir || eof {
-		err = fmt.Errorf("ConsensusState.Deserialize EOF at HasBlk")
+		err = fmt.Errorf("ConsensusState.Deserialize candidateBlk bool EOF")
 		return
 	}
-	if hasBlk {
-		cs.CandidateBlk = cs.CandidateBlk.Default()
-		err = cs.CandidateBlk.Deserialize(source)
+	if candidateBlk {
+		block := DefaultBlockFunc()
+		err = block.Deserialize(source)
 		if err != nil {
 			return
 		}
+		cs.candidateBlk = block
 	}
-	hasQC, ir, eof := source.NextBool()
+
+	lockQC, ir, eof := source.NextBool()
 	if ir || eof {
-		err = fmt.Errorf("ConsensusState.Deserialize EOF at HasQC")
+		err = fmt.Errorf("ConsensusState.Deserialize lockQC bool EOF")
 		return
 	}
-	if hasQC {
-		cs.LockQC = &QC{}
-		err = cs.LockQC.Deserialize(source)
+	if lockQC {
+		qc := &QC{}
+		err = qc.Deserialize(source)
 		if err != nil {
 			return
 		}
-	}
-	if hasBlk != hasQC {
-		err = fmt.Errorf("inconsistent consensus state detected: (hasBlk:%v hasQC:%v)", hasBlk, hasQC)
-		return
+		cs.lockQC = qc
 	}
 
-	hasVoted, ir, eof := source.NextBool()
+	hasVotedPrepare, ir, eof := source.NextBool()
 	if ir || eof {
-		err = fmt.Errorf("ConsensusState.Deserialize EOF at HasVoted")
+		err = fmt.Errorf("ConsensusState.Deserialize hasVotedPrepare EOF")
 		return
 	}
-	if hasVoted && cs.CandidateBlk == nil {
-		err = fmt.Errorf("inconsistent consensus state detected: (HasVoted:%v CandidateBlk:nil)", hasVoted)
+	cs.hasVotedPrepare = hasVotedPrepare
+
+	cs.votes1 = make(map[int][]byte)
+	count, eof := source.NextInt32()
+	if eof {
+		err = fmt.Errorf("ConsensusState.Deserialize #votes1 EOF")
 		return
+	}
+	for i := 0; i < int(count); i++ {
+		id, eof := source.NextInt64()
+		if eof {
+			err = fmt.Errorf("ConsensusState.Deserialize votes1.id EOF")
+			return
+		}
+		vote, _, ir, eof := source.NextVarBytes()
+		if ir || eof {
+			err = fmt.Errorf("ConsensusState.Deserialize votes1.vote EOF")
+			return
+		}
+		cs.votes1[int(id)] = vote
 	}
 
-	cs.Height = height
-	cs.View = view
-	cs.HasVoted = hasVoted
+	cs.votes2 = make(map[int][]byte)
+	count, eof = source.NextInt32()
+	if eof {
+		err = fmt.Errorf("ConsensusState.Deserialize #votes2 EOF")
+		return
+	}
+	for i := 0; i < int(count); i++ {
+		id, eof := source.NextInt64()
+		if eof {
+			err = fmt.Errorf("ConsensusState.Deserialize votes2.id EOF")
+			return
+		}
+		vote, _, ir, eof := source.NextVarBytes()
+		if ir || eof {
+			err = fmt.Errorf("ConsensusState.Deserialize votes2.vote EOF")
+			return
+		}
+		cs.votes2[int(id)] = vote
+	}
+
+	count, eof = source.NextInt32()
+	if eof {
+		err = fmt.Errorf("ConsensusState.Deserialize #voted EOF")
+		return
+	}
+	cs.voted = make([]ID, count)
+	for i := 0; i < int(count); i++ {
+		id, _, ir, eof := source.NextVarBytes()
+		if ir || eof {
+			err = fmt.Errorf("ConsensusState.Deserialize voted.%d EOF #voted:%d", i, count)
+			return
+		}
+		if len(id) > 0 {
+			cs.voted[i] = ID(id)
+		}
+	}
+
+	idx, eof := source.NextInt64()
+	if eof {
+		err = fmt.Errorf("ConsensusState.Deserialize idx EOF")
+		return
+	}
+	cs.idx = int(idx)
 	return
+}
+
+func (cs *ConsensusState) advanceToHeight(height uint64, hs *HotStuff) {
+	atomic.StoreUint64(&cs.height, height)
+	atomic.StoreUint64(&cs.view, 0)
+	cs.candidateBlk = nil
+	cs.lockQC = nil
+	cs.hasVotedPrepare = false
+
+	cs.idx = hs.store.ValidatorIndex(height, hs.conf.ProposerID)
+	count := int(hs.store.ValidatorCount(height))
+	if hs.idx >= count {
+		panic(fmt.Sprintf("invalid index(%d) for proposer:%s", hs.idx, hs.conf.ProposerID))
+	}
+	cs.resetVote(count)
+}
+
+func (cs *ConsensusState) resetVote(count int) {
+	cs.votes1 = make(map[int][]byte)
+	cs.votes2 = make(map[int][]byte)
+	if count == 0 {
+		count = len(cs.voted)
+	}
+	cs.voted = make([]ID, count)
+}
+
+func (cs *ConsensusState) advanceToView(view uint64) {
+	atomic.StoreUint64(&cs.view, view)
+	cs.hasVotedPrepare = false
+	cs.resetVote(0)
 }
 
 type Logger interface {

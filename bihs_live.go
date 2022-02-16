@@ -1,47 +1,55 @@
 package bihs
 
 import (
-	"encoding/hex"
 	"fmt"
 	"math"
-	"sync/atomic"
 	"time"
 )
 
 func (hs *HotStuff) loop() {
 
-	syncTicker := time.NewTicker(hs.conf.SyncCheckInterval)
-	defer syncTicker.Stop()
-
-	var proposeRelayTimerCh <-chan time.Time
+	var relayTimerCh <-chan time.Time
 
 	for {
 
-		if hs.proposeRelayTimer != nil {
-			proposeRelayTimerCh = hs.proposeRelayTimer.C
+		if hs.relayTimer != nil {
+			relayTimerCh = hs.relayTimer.C
 		} else {
-			proposeRelayTimerCh = nil
+			relayTimerCh = nil
 		}
 
 		select {
-		case proposal, ok := <-hs.proposeCh:
-			if !ok {
-				hs.restoreConsensusState()
-				return
-			}
+		case proposal := <-hs.proposeCh:
 
 			if !hs.isLeader(hs.height, hs.view) {
-				hs.conf.Logger.Errorf("proposer(%s) not in turn, height(%d) view(%d)", string(hs.conf.ProposerID), hs.height, hs.view)
+				hs.conf.Logger.Errorf("proposer(%s) not in turn, height(%d) view(%d)", hs.conf.ProposerID, hs.height, hs.view)
 				continue
 			}
 			if hs.view != 0 {
-				hs.conf.Logger.Errorf("proposal(%s) Propose not in view 0", string(hs.conf.ProposerID))
+				hs.conf.Logger.Errorf("proposal(%s) Propose not in view 0", hs.conf.ProposerID)
 				continue
 			}
+			switch {
+			case proposal.Height() < hs.height:
+				hs.conf.Logger.Errorf("proposal(%s) Propose height decrease, proposal.height=%d, hs.height=%d", hs.conf.ProposerID, proposal.Height(), hs.height)
+				continue
+			case proposal.Height() == hs.height:
+				if hs.candidateBlk != nil {
+					hs.conf.Logger.Errorf("proposal(%s) Propose twice in the same height, last:%v, current:%v", hs.conf.ProposerID, hs.candidateBlk.Hash(), proposal.Hash())
+					continue
+				}
+			case proposal.Height() > hs.height:
+				hs.enterHeightView(proposal.Height(), 0)
+			}
+
 			hs.onProposal(proposal, nil)
 
+		case <-hs.closeCh:
+			hs.restoreConsensusState()
+			return
 		case msg, ok := <-hs.p2p.MsgCh():
 			if !ok {
+				hs.restoreConsensusState()
 				return
 			}
 
@@ -55,7 +63,7 @@ func (hs *HotStuff) loop() {
 				continue
 			}
 
-			idx := hs.conf.ValidatorIndex(hs.height, sender)
+			idx := hs.store.ValidatorIndex(hs.height, sender)
 			if idx < 0 {
 				continue
 			}
@@ -72,28 +80,28 @@ func (hs *HotStuff) loop() {
 			switch msg.Type {
 			case MTPrepare:
 				if hs.isLeader(msgHeight, msg.View) {
-					hs.onRecvVote1(sender, idx, msg)
+					hs.onRecvPrepareVote(sender, idx, msg)
 				} else {
-					hs.onRecvProposal1(sender, msg)
+					hs.onRecvPrepare(sender, idx, msg)
+				}
+			case MTPreCommit:
+				if hs.isLeader(msgHeight, msg.View) {
+					hs.onRecvPrecommitVote(sender, idx, msg)
+				} else {
+					hs.onRecvPrecommit(sender, idx, msg)
 				}
 			case MTCommit:
 				if hs.isLeader(msgHeight, msg.View) {
-					hs.onRecvVote2(sender, idx, msg)
-				} else {
-					hs.onRecvProposal2(sender, msg)
-				}
-			case MTDecide:
-				if hs.isLeader(msgHeight, msg.View) {
 					hs.conf.Logger.Errorf("got MTCommit msg as leader")
 				} else {
-					hs.onRecvProposal3(sender, msg)
+					hs.onRecvCommit(sender, idx, msg)
 				}
 			case MTNewView:
 				if hs.isLeader(msgHeight, msg.View+1) {
-					hs.onRecvNewView(sender, msg)
+					hs.onRecvNewView(sender, idx, msg)
 				}
 			case MTReqBlock:
-				hs.onReqBlock(sender, msg)
+				hs.onReqBlock(sender, idx, msg)
 			case MTRespBlock:
 				if hs.waitBlock != nil {
 					hs.waitBlock(sender, msg)
@@ -104,19 +112,25 @@ func (hs *HotStuff) loop() {
 		case <-hs.nvInterrupt.C:
 			hs.onNextSyncView()
 			hs.enterHeightView(hs.height, hs.view+1)
-		case <-proposeRelayTimerCh:
+		case <-relayTimerCh:
 			hs.relayPropose()
-		case <-syncTicker.C:
+		case <-hs.heightChangeCh:
 			if hs.store.Height() >= hs.height {
 				hs.enterHeightView(hs.store.Height()+1, 0)
 			}
 		}
+	}
+}
 
+func (hs *HotStuff) HeightChanged() {
+	select {
+	case hs.heightChangeCh <- struct{}{}:
+	default:
 	}
 }
 
 func (hs *HotStuff) onNextSyncView() {
-	leader := hs.conf.SelectLeader(hs.height, hs.view+1)
+	leader := hs.store.SelectLeader(hs.height, hs.view+1)
 	if hs.lockQC != nil {
 		hs.p2p.Send(leader, hs.createMsg(MTNewView, hs.lockQC, nil))
 	}
@@ -124,69 +138,84 @@ func (hs *HotStuff) onNextSyncView() {
 
 func (hs *HotStuff) applyBlock(blk Block, commitQC *QC) (err error) {
 
-	err = hs.store.StoreBlock(blk, hs.lockQC, commitQC)
+	err = hs.store.StoreBlock(blk, commitQC)
 	if err != nil {
 		hs.conf.Logger.Errorf("applyBlock failed:%v", err)
 		return
 	}
 
+	if timeBlk, ok := blk.(BlockWithTime); ok {
+		// adjust time skew
+		expectedTime := hs.lastBlockTime*uint64(time.Millisecond) + uint64(hs.conf.BlockInterval)
+		now := uint64(time.Now().UnixMilli()) * uint64(time.Millisecond)
+		if now < expectedTime {
+			hs.conf.Logger.Infof("adjust time skew, sleep %v", time.Duration(expectedTime-now))
+			time.Sleep(time.Duration(expectedTime - now))
+		}
+		hs.lastBlockTime = timeBlk.TimeMil()
+	}
 	hs.enterHeightView(blk.Height()+1, 0)
 
 	return
 }
 
 func (hs *HotStuff) enterHeightView(height, view uint64) {
-	hs.conf.Logger.Infof("proposer %s enter height %d view %d", string(hs.conf.ProposerID), height, view)
+	if !(height > hs.height || height == hs.height && view >= hs.view) {
+		panic(fmt.Sprintf("height view invariance is broken, height:%d hs.height:%d view:%d, hs.view:%d", height, hs.height, view, hs.view))
+	}
+	hs.conf.Logger.Infof("proposer %d enter height %d view %d", hs.idx, height, view)
 
 	if hs.nvInterrupt != nil {
 		hs.nvInterrupt.Stop()
 	}
-	if height > hs.height {
-		hs.lockQC = nil
-		hs.candidateBlk = nil
-		hs.waiter.Done(int64(hs.height))
-		hs.prepareState(height)
-		hs.hasVoted = false
-	} else if view > hs.view {
-		hs.hasVoted = false
-	}
 
-	atomic.StoreUint64(&hs.height, height)
-	atomic.StoreUint64(&hs.view, view)
 	timeout := hs.calcViewTimeout()
 	hs.nvInterrupt = time.NewTimer(timeout)
-	hs.votes1 = make(map[int][]byte)
-	hs.votes2 = make(map[int][]byte)
 	hs.waitBlock = nil
 
-	if hs.proposeRelayTimer != nil {
-		hs.proposeRelayTimer.Stop()
-		hs.proposeRelayTimer = nil
+	if hs.relayTimer != nil {
+		hs.relayTimer.Stop()
+		hs.relayTimer = nil
 	}
+
 	isLeader := hs.isLeader(height, view)
-	if view > 0 {
-		if isLeader {
-			hs.proposeRelayTimer = time.NewTimer(timeout / 5)
+
+	switch {
+	case height > hs.height:
+		hs.advanceToHeight(height, hs)
+		hs.waiter.Done(int64(height - 1))
+	case view > hs.view:
+		hs.advanceToView(view)
+	default:
+		// the same height and view
+		// in this case, node has just restarted
+
+		if view > 0 && isLeader {
+			hs.relayPropose()
+			return
 		}
 	}
-}
 
-func (hs *HotStuff) prepareState(height uint64) {
-	hs.idx = hs.conf.ValidatorIndex(height, hs.conf.ProposerID)
-	count := int(hs.conf.ValidatorCount(height))
-	if hs.idx < 0 || hs.idx >= count {
-		panic(fmt.Sprintf("invalid index(%d) for proposer:%s", hs.idx, hex.EncodeToString(hs.conf.ProposerID)))
+	if isLeader {
+		hs.relayTimer = time.NewTimer(timeout / 3)
 	}
-	hs.voted = make([]ID, count)
 }
 
 func (hs *HotStuff) relayPropose() {
 	if hs.lockQC != nil {
 		hs.onProposal(hs.candidateBlk, hs.lockQC)
-	} else {
-		hs.onProposal(hs.conf.EmptyBlock(hs.height), nil)
-		hs.conf.Logger.Infof("proposer %s relayPropose empty", string(hs.conf.ProposerID))
+		hs.conf.Logger.Infof("proposer %d relayPropose locked", hs.idx)
+		return
 	}
+
+	blk, err := hs.store.EmptyBlock(hs.height)
+	if err != nil {
+		hs.conf.Logger.Errorf("proposer %d EmptyBlock failed:%v", hs.idx, err)
+		return
+	}
+	hs.onProposal(blk, nil)
+	hs.conf.Logger.Infof("proposer %d relayPropose empty", hs.idx)
+
 }
 
 func (hs *HotStuff) calcViewTimeout() time.Duration {

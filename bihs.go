@@ -1,7 +1,6 @@
 package bihs
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"io/ioutil"
@@ -17,25 +16,20 @@ import (
 
 // HotStuff ...
 type HotStuff struct {
-	view              uint64
-	height            uint64
-	status            int32
-	idx               int
-	proposeCh         chan Block
-	candidateBlk      Block
-	lockQC            *QC
-	hasVoted          bool
-	votes1            map[int][]byte
-	votes2            map[int][]byte
-	voted             []ID
-	p2p               P2P
-	store             StateDB
-	conf              Config
-	proposeRelayTimer *time.Timer
-	nvInterrupt       *time.Timer
-	waiter            *wm.Offset
-	wg                sync.WaitGroup
-	waitBlock         func(ID, *Msg)
+	ConsensusState
+	status         int32
+	proposeCh      chan Block
+	closeCh        chan struct{}
+	heightChangeCh chan struct{}
+	p2p            P2P
+	store          StateDB
+	conf           Config
+	relayTimer     *time.Timer
+	nvInterrupt    *time.Timer
+	waiter         *wm.Offset
+	wg             sync.WaitGroup
+	waitBlock      func(ID, *Msg)
+	lastBlockTime  uint64
 
 	createMsg      func(mt MsgType, justify *QC, node *BlockOrHash) *Msg
 	sign           func([]byte) []byte
@@ -45,18 +39,7 @@ type HotStuff struct {
 	generateBitmap func(votes map[int][]byte) []byte
 }
 
-func New(genesis Block, store StateDB, p2p P2P, conf Config) *HotStuff {
-	b0 := store.GetBlock(0)
-	if b0 == nil {
-		err := store.StoreBlock(genesis, nil, nil)
-		if err != nil {
-			panic(fmt.Sprintf("StateDB.StoreNode failed:%v", err))
-		}
-	} else {
-		if !bytes.Equal(b0.Hash(), genesis.Hash()) {
-			panic("stored genesis doesn't match")
-		}
-	}
+func New(store StateDB, p2p P2P, conf Config) *HotStuff {
 
 	err := conf.validate()
 	if err != nil {
@@ -64,11 +47,13 @@ func New(genesis Block, store StateDB, p2p P2P, conf Config) *HotStuff {
 	}
 
 	hs := &HotStuff{
-		proposeCh: make(chan Block),
-		p2p:       p2p,
-		store:     store,
-		conf:      conf,
-		waiter:    wm.NewOffset(),
+		proposeCh:      make(chan Block),
+		closeCh:        make(chan struct{}),
+		heightChangeCh: make(chan struct{}, 1),
+		p2p:            p2p,
+		store:          store,
+		conf:           conf,
+		waiter:         wm.NewOffset(),
 	}
 
 	if conf.BlsSigner != nil {
@@ -98,6 +83,7 @@ func (hs *HotStuff) Start() (err error) {
 		return
 	}
 
+	hs.store.SubscribeHeightChange(hs)
 	err = hs.initConsensusState()
 	if err != nil {
 		return
@@ -111,10 +97,12 @@ func (hs *HotStuff) Start() (err error) {
 const consensusFile = "/consensus.dat"
 
 func (hs *HotStuff) initConsensusState() (err error) {
-	fullPath := hs.conf.WalPath + consensusFile
+
+	fullPath := hs.conf.DataDir + consensusFile
 	if _, err = os.Stat(fullPath); os.IsNotExist(err) {
 		err = nil
-		hs.applyState(&ConsensusState{Height: hs.store.Height() + 1})
+		hs.advanceToHeight(hs.store.Height()+1, hs)
+		hs.conf.Logger.Infof("initConsensusState height=%d view=0", hs.store.Height()+1)
 		return
 	}
 
@@ -123,47 +111,43 @@ func (hs *HotStuff) initConsensusState() (err error) {
 		hs.conf.Logger.Error("initConsensusState failed:%v", err)
 		return
 	}
-	source := common.NewZeroCopySource(data)
-	cs := &ConsensusState{}
-	err = cs.Deserialize(source)
+
+	cs := ConsensusState{}
+	err = cs.Deserialize(common.NewZeroCopySource(data))
 	if err != nil {
-		hs.conf.Logger.Error("initConsensusState failed:%v", err)
+		hs.conf.Logger.Error("initConsensusState cs.Deserialize failed:%v", err)
 		return
 	}
 
-	if cs.Height > hs.store.Height()+1 {
+	if cs.height > hs.store.Height()+1 {
 		err = fmt.Errorf("inconsistent state found")
 		return
 	}
-	if cs.Height < hs.store.Height()+1 {
-		cs = &ConsensusState{Height: hs.store.Height() + 1}
+	if cs.height < hs.store.Height()+1 {
+		hs.advanceToHeight(hs.store.Height()+1, hs)
+		hs.conf.Logger.Infof("initConsensusState height=%d view=0", hs.store.Height()+1)
+		return
 	}
+	hs.ConsensusState = cs
+	hs.conf.Logger.Infof("initConsensusState height=%d view=%d", hs.height, hs.view)
 
-	hs.applyState(cs)
 	return
 }
 
-func (hs *HotStuff) applyState(cs *ConsensusState) {
-	hs.height = cs.Height
-	hs.view = cs.View
-	hs.hasVoted = cs.HasVoted
-	hs.candidateBlk = cs.CandidateBlk
-	hs.lockQC = cs.LockQC
-	hs.prepareState(hs.height)
-}
-
 func (hs *HotStuff) restoreConsensusState() {
-	cs := ConsensusState{Height: hs.height, View: hs.view, CandidateBlk: hs.candidateBlk, LockQC: hs.lockQC, HasVoted: hs.hasVoted}
+	cs := hs.ConsensusState
 
 	sink := common.NewZeroCopySink(nil)
 	cs.Serialize(sink)
+	csBytes := sink.Bytes()
 
 	util.TryUntilSuccess(func() bool {
-		err := ioutil.WriteFile(hs.conf.WalPath+consensusFile, sink.Bytes(), 0777)
+		err := ioutil.WriteFile(hs.conf.DataDir+consensusFile, csBytes, 0777)
 		if err != nil {
 			hs.conf.Logger.Error("restoreConsensusState failed:%v", err)
 			return false
 		}
+		hs.conf.Logger.Infof("consensus state stored at %s #len %d", hs.conf.DataDir+consensusFile, len(csBytes))
 		return true
 	}, time.Second)
 
@@ -185,13 +169,14 @@ func (hs *HotStuff) Stop() (err error) {
 		return
 	}
 
-	close(hs.proposeCh)
+	close(hs.closeCh)
+	hs.store.UnSubscribeHeightChange(hs)
 	hs.wg.Wait()
 	return
 }
 
 func (hs *HotStuff) Propose(ctx context.Context, blk Block) (err error) {
-	err = blk.Validate()
+	err = hs.store.Validate(blk)
 	if err != nil {
 		return
 	}
@@ -207,6 +192,7 @@ func (hs *HotStuff) Propose(ctx context.Context, blk Block) (err error) {
 		select {
 		case hs.proposeCh <- blk:
 		case <-ctx.Done():
+		case <-hs.closeCh:
 		}
 
 	}()
@@ -218,10 +204,10 @@ func (hs *HotStuff) Wait(ctx context.Context, height uint64) error {
 	return hs.waiter.Wait(ctx, int64(height))
 }
 
-func (hs *HotStuff) Height() uint64 {
+func (hs *HotStuff) ConsensusHeight() uint64 {
 	return atomic.LoadUint64(&hs.height)
 }
 
-func (hs *HotStuff) View() uint64 {
+func (hs *HotStuff) ConsensusView() uint64 {
 	return atomic.LoadUint64(&hs.view)
 }

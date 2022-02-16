@@ -7,9 +7,9 @@ import (
 	"github.com/zhiqiangxu/util"
 )
 
-func (hs *HotStuff) onRecvNewView(sender ID, msg *Msg) {
+func (hs *HotStuff) onRecvNewView(sender ID, idx int, msg *Msg) {
 	qc := msg.Justify
-	if qc != nil && (hs.lockQC == nil || qc.View > hs.lockQC.View) && qc.Validate(hs) == nil {
+	if qc != nil && (hs.lockQC == nil || qc.View > hs.lockQC.View) && qc.validate(hs) == nil {
 		afterGotBlk := func() {
 			hs.lockQC = qc
 		}
@@ -21,6 +21,9 @@ func (hs *HotStuff) onRecvNewView(sender ID, msg *Msg) {
 
 		hs.waitBlock = func(_ ID, blkMsg *Msg) {
 			if blkMsg.Node.Blk == nil || !bytes.Equal(blkMsg.Node.Blk.Hash(), qc.BlockHash) {
+				return
+			}
+			if err := hs.store.Validate(blkMsg.Node.Blk); err != nil {
 				return
 			}
 			if !(hs.lockQC == nil || qc.View > hs.lockQC.View) {
@@ -44,57 +47,81 @@ func (hs *HotStuff) onProposal(blk Block, qc *QC) {
 			return
 		}
 	}
-	hs.candidateBlk = blk
+	if hs.hasVotedPrepare && !bytes.Equal(hs.candidateBlk.Hash(), blk.Hash()) {
+		hs.conf.Logger.Infof("proposer %d tried to propose two different blocks, previous:%s current:%s", hs.idx, hs.candidateBlk.Hash(), blk.Hash())
+		blk = hs.candidateBlk
+	} else {
+		hs.hasVotedPrepare = true
+		hs.candidateBlk = blk
+	}
 
 	prepareMsg := hs.createMsg(MTPrepare, qc, &BlockOrHash{Blk: blk})
-	hs.conf.Logger.Infof("proposer %s sent Proposal1 %v", string(hs.conf.ProposerID), prepareMsg)
+	hs.conf.Logger.Infof("proposer %d sent prepare %s for height:%d view:%d", hs.idx, prepareMsg.Hash(), hs.height, hs.view)
 	hs.p2p.Broadcast(prepareMsg)
 
-	hs.onRecvVote1(hs.conf.ProposerID, hs.idx, prepareMsg)
+	hs.onRecvPrepareVote(hs.conf.ProposerID, hs.idx, prepareMsg)
 }
 
-func (hs *HotStuff) onRecvProposal1(sender ID, msg *Msg) {
-	hs.conf.Logger.Infof("proposer %s received Proposal1 %v", string(hs.conf.ProposerID), msg)
+func (hs *HotStuff) onRecvPrepare(sender ID, idx int, msg *Msg) {
+	hs.conf.Logger.Infof("proposer %d received prepare %s from %d for height:%d view:%d", hs.idx, msg.Hash(), idx, hs.height, hs.view)
 	if !hs.matchingMsg(msg, MTPrepare, hs.view) {
-		hs.conf.Logger.Error("Proposal1 not match")
+		hs.conf.Logger.Errorf("prepare not match, expect (%d, %d) got (%d, %d)", hs.height, hs.view, msg.Height, msg.View)
 		return
 	}
 
 	if msg.Node.Blk == nil {
+		hs.conf.Logger.Error("prepare with no Block")
 		return
 	}
-	if msg.Justify != nil {
-		err := msg.Justify.Validate(hs)
-		if err != nil {
-			hs.conf.Logger.Errorf("Proposal1 Justify invalid:%v", err)
+
+	if msg.Node.Blk.Height() != msg.Height {
+		hs.conf.Logger.Errorf("prepare block height(%d) != msg height(%d)", msg.Node.Blk.Height(), msg.Height)
+		return
+	}
+	if err := hs.store.Validate(msg.Node.Blk); err != nil {
+		hs.conf.Logger.Errorf("prepare block Validate failed:%v block hash:%d", err, msg.Node.Blk.Hash())
+		return
+	}
+
+	switch {
+	case msg.View == 0:
+		if !msg.Node.Blk.Empty() && !bytes.Equal(hs.store.SelectLeader(msg.Node.Blk.Height(), 0), sender) {
+			hs.conf.Logger.Errorf("proposer %s tried to propose when not in turn", sender)
 			return
+		}
+	case msg.View > 0:
+		if !msg.Node.Blk.Empty() && msg.Justify == nil {
+			hs.conf.Logger.Errorf("proposer %s tried to relay propose with no qc", sender)
+			return
+		}
+		if msg.Justify != nil {
+			err := msg.Justify.validate(hs)
+			if err != nil {
+				hs.conf.Logger.Errorf("prepare Justify invalid:%v", err)
+				return
+			}
+			if !bytes.Equal(msg.Justify.BlockHash, msg.Node.BlockHash()) {
+				hs.conf.Logger.Errorf("prepare Justify doesn't match proposal, justify:%s, proposal:%s", msg.Justify.BlockHash, msg.Node.BlockHash())
+				return
+			}
 		}
 	}
 
-	err := msg.Node.Blk.Validate()
-	if err != nil {
-		hs.conf.Logger.Errorf("Proposal1 Node invalid:%v", err)
-		return
-	}
-
-	if !hs.store.IsBlockProposableBy(msg.Node.Blk, sender) {
-		hs.conf.Logger.Errorf("proposer %s not IsBlockProposableBy", string(hs.conf.ProposerID))
-		return
-	}
-	if !hs.hasVoted && hs.safeNode(msg.Node, msg.Justify) {
+	if !hs.hasVotedPrepare && hs.safeNode(msg.Node, msg.Justify) {
 		hs.candidateBlk = msg.Node.Blk
-		hs.hasVoted = true
+		hs.hasVotedPrepare = true
 
 		voteMsg := hs.voteMsg(MTPrepare, msg.BlockHash())
 		hs.p2p.Send(sender, voteMsg)
 	}
 
-	hs.conf.Logger.Infof("proposer %v onRecvProposal1 done", string(hs.conf.ProposerID))
+	hs.conf.Logger.Infof("proposer %d onRecvPrepare done", hs.idx)
 }
 
-func (hs *HotStuff) onRecvVote1(sender ID, idx int, msg *Msg) {
-	hs.conf.Logger.Infof("proposer %s received Vote1 %v", string(hs.conf.ProposerID), msg)
+func (hs *HotStuff) onRecvPrepareVote(sender ID, idx int, msg *Msg) {
+	hs.conf.Logger.Infof("proposer %d received PrepareVote %s from %d for height:%d view:%d", hs.idx, msg.Hash(), idx, hs.height, hs.view)
 	if !hs.matchingMsg(msg, MTPrepare, hs.view) {
+		hs.conf.Logger.Error("prepare vote not match, expect (%d, %d) got (%d, %d)", hs.height, hs.view, msg.Height, msg.View)
 		return
 	}
 
@@ -102,29 +129,26 @@ func (hs *HotStuff) onRecvVote1(sender ID, idx int, msg *Msg) {
 		return
 	}
 
-	voter, err := hs.verify(msg)
-	if err != nil {
-		return
-	}
 	if _, ok := hs.votes1[idx]; ok {
 		return
 	}
 
-	hs.voted[idx] = voter
+	hs.voted[idx] = sender
 	hs.votes1[idx] = msg.PartialSig
 
-	if len(hs.votes1) == int(quorum(hs.conf.ValidatorCount(msg.Height))) {
+	if len(hs.votes1) == int(quorum(hs.store.ValidatorCount(msg.Height))) {
 		hs.lockQC = hs.createQC(msg, hs.votes1)
-		commitMsg := hs.createMsg(MTCommit, hs.lockQC, nil)
-		hs.conf.Logger.Infof("proposer %s sent Proposal2 %v", string(hs.conf.ProposerID), commitMsg)
-		hs.p2p.Broadcast(commitMsg)
-		hs.onRecvVote2(hs.conf.ProposerID, hs.idx, commitMsg)
+		precommitMsg := hs.createMsg(MTPreCommit, hs.lockQC, nil)
+		hs.conf.Logger.Infof("proposer %d sent precommit %s", hs.idx, precommitMsg.Hash())
+		hs.p2p.Broadcast(precommitMsg)
+		hs.onRecvPrecommitVote(hs.conf.ProposerID, hs.idx, precommitMsg)
 	}
 }
 
-func (hs *HotStuff) onRecvProposal2(sender ID, msg *Msg) {
-	hs.conf.Logger.Infof("proposer %s received Proposal2 %v", string(hs.conf.ProposerID), msg)
-	if !hs.matchingMsg(msg, MTCommit, hs.view) {
+func (hs *HotStuff) onRecvPrecommit(sender ID, idx int, msg *Msg) {
+	hs.conf.Logger.Infof("proposer %d received Precommit %s from %d for height:%d view:%d", hs.idx, msg.Hash(), idx, hs.height, hs.view)
+	if !hs.matchingMsg(msg, MTPreCommit, hs.view) {
+		hs.conf.Logger.Error("precommit not match, expect (%d, %d) got (%d, %d)", hs.height, hs.view, msg.Height, msg.View)
 		return
 	}
 	if msg.Justify == nil {
@@ -134,16 +158,16 @@ func (hs *HotStuff) onRecvProposal2(sender ID, msg *Msg) {
 		return
 	}
 
-	err := msg.Justify.Validate(hs)
+	err := msg.Justify.validate(hs)
 	if err != nil {
 		return
 	}
 
 	afterGotBlk := func() {
-		voteMsg := hs.voteMsg(MTCommit, msg.Justify.BlockHash)
+		voteMsg := hs.voteMsg(MTPreCommit, msg.Justify.BlockHash)
 		hs.lockQC = msg.Justify
 		hs.p2p.Send(sender, voteMsg)
-		hs.conf.Logger.Infof("proposer %v onRecvProposal2 done", string(hs.conf.ProposerID))
+		hs.conf.Logger.Infof("proposer %d onRecvPrecommit done", hs.idx)
 	}
 	if hs.candidateBlk == nil || !bytes.Equal(hs.candidateBlk.Hash(), msg.Justify.BlockHash) {
 		hs.candidateBlk = nil
@@ -152,6 +176,9 @@ func (hs *HotStuff) onRecvProposal2(sender ID, msg *Msg) {
 				return
 			}
 			if !bytes.Equal(msg.Justify.BlockHash, blkMsg.Node.Blk.Hash()) {
+				return
+			}
+			if err := hs.store.Validate(blkMsg.Node.Blk); err != nil {
 				return
 			}
 			hs.candidateBlk = blkMsg.Node.Blk
@@ -170,7 +197,7 @@ func (hs *HotStuff) requestBlk(from ID, blkHash []byte) {
 	hs.p2p.Send(from, hs.createMsg(MTReqBlock, nil, &BlockOrHash{Hash: blkHash}))
 }
 
-func (hs *HotStuff) onReqBlock(sender ID, msg *Msg) {
+func (hs *HotStuff) onReqBlock(sender ID, idx int, msg *Msg) {
 
 	if bytes.Equal(msg.Node.Hash, hs.candidateBlk.Hash()) {
 		hs.p2p.Send(sender, hs.createMsg(MTRespBlock, nil, &BlockOrHash{Blk: hs.candidateBlk}))
@@ -178,9 +205,10 @@ func (hs *HotStuff) onReqBlock(sender ID, msg *Msg) {
 
 }
 
-func (hs *HotStuff) onRecvVote2(sender ID, idx int, msg *Msg) {
-	hs.conf.Logger.Infof("proposer %s received Vote2 %v", string(hs.conf.ProposerID), msg)
-	if !hs.matchingMsg(msg, MTCommit, hs.view) {
+func (hs *HotStuff) onRecvPrecommitVote(sender ID, idx int, msg *Msg) {
+	hs.conf.Logger.Infof("proposer %d received PrecommitVote %s from %d for height:%d view:%d", hs.idx, msg.Hash(), idx, hs.height, hs.view)
+	if !hs.matchingMsg(msg, MTPreCommit, hs.view) {
+		hs.conf.Logger.Error("precommit vote not match, expect (%d, %d) got (%d, %d)", hs.height, hs.view, msg.Height, msg.View)
 		return
 	}
 	if !bytes.Equal(msg.BlockHash(), hs.candidateBlk.Hash()) {
@@ -198,29 +226,30 @@ func (hs *HotStuff) onRecvVote2(sender ID, idx int, msg *Msg) {
 	hs.voted[idx] = voter
 	hs.votes2[idx] = msg.PartialSig
 
-	if len(hs.votes2) == int(quorum(hs.conf.ValidatorCount(msg.Height))) {
+	if len(hs.votes2) == int(quorum(hs.store.ValidatorCount(msg.Height))) {
 		commitQC := hs.createQC(msg, hs.votes2)
-		hs.conf.Logger.Infof("proposer %s sent Proposal3 %v", string(hs.conf.ProposerID), commitQC)
-		commitMsg := hs.createMsg(MTDecide, commitQC, nil)
+		commitMsg := hs.createMsg(MTCommit, commitQC, nil)
+		hs.conf.Logger.Infof("proposer %d sent commit %s", hs.idx, commitMsg.Hash())
 		hs.p2p.Broadcast(commitMsg)
 
-		hs.onRecvProposal3(hs.conf.ProposerID, commitMsg)
+		hs.onRecvCommit(hs.conf.ProposerID, hs.idx, commitMsg)
 	}
 }
 
-func (hs *HotStuff) onRecvProposal3(sender ID, msg *Msg) {
-	hs.conf.Logger.Infof("proposer %s received Proposal3 %v", string(hs.conf.ProposerID), msg)
-	if !hs.matchingMsg(msg, MTDecide, hs.view) {
+func (hs *HotStuff) onRecvCommit(sender ID, idx int, msg *Msg) {
+	hs.conf.Logger.Infof("proposer %d received Commit %s from %d for height:%d view:%d", hs.idx, msg.Hash(), idx, hs.height, hs.view)
+	if !hs.matchingMsg(msg, MTCommit, hs.view) {
+		hs.conf.Logger.Error("commit not match, expect (%d, %d) got (%d, %d)", hs.height, hs.view, msg.Height, msg.View)
 		return
 	}
 	if msg.Justify == nil {
 		return
 	}
-	if !hs.matchingQC(msg.Justify, MTCommit, hs.view) {
+	if !hs.matchingQC(msg.Justify, MTPreCommit, hs.view) {
 		return
 	}
 
-	err := msg.Justify.Validate(hs)
+	err := msg.Justify.validate(hs)
 	if err != nil {
 		return
 	}
@@ -229,7 +258,7 @@ func (hs *HotStuff) onRecvProposal3(sender ID, msg *Msg) {
 		util.TryUntilSuccess(func() bool {
 			return hs.applyBlock(hs.candidateBlk, msg.Justify) == nil
 		}, time.Second)
-		hs.conf.Logger.Infof("proposer %v onRecvProposal3 done", string(hs.conf.ProposerID))
+		hs.conf.Logger.Infof("proposer %d onRecvCommit done", hs.idx)
 	}
 	if hs.candidateBlk == nil || !bytes.Equal(hs.candidateBlk.Hash(), msg.Justify.BlockHash) {
 		hs.candidateBlk = nil
@@ -238,6 +267,9 @@ func (hs *HotStuff) onRecvProposal3(sender ID, msg *Msg) {
 				return
 			}
 			if !bytes.Equal(msg.Justify.BlockHash, blkMsg.Node.Blk.Hash()) {
+				return
+			}
+			if err := hs.store.Validate(blkMsg.Node.Blk); err != nil {
 				return
 			}
 			hs.candidateBlk = blkMsg.Node.Blk
