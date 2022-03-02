@@ -323,10 +323,9 @@ type StateDB interface {
 	Height() uint64
 	SubscribeHeightChange(HeightChangeSub)
 	UnSubscribeHeightChange(HeightChangeSub)
-
+	MakeBlock(height uint64, mustEmpty bool) (Block, error)
 	ValidatorIndex(height uint64, peer ID) int
 	SelectLeader(height, view uint64) ID
-	EmptyBlock(height uint64) (Block, error)
 	ValidatorCount(height uint64) int32
 	ValidatorIDs(height uint64) []ID
 
@@ -361,6 +360,7 @@ type Config struct {
 	BlockInterval time.Duration
 	ProposerID    ID
 	DataDir       string
+	Promiscuous   bool
 
 	EcSigner         EcSigner
 	BlsSigner        BlsSigner

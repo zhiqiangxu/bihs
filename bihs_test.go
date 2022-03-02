@@ -132,7 +132,7 @@ func (db *HappyDB) ValidatorIndex(height uint64, peer ID) int {
 func (db *HappyDB) SelectLeader(height, view uint64) ID {
 	return ID([]byte(fmt.Sprintf("%d", (height+view)%uint64(db.validators))))
 }
-func (db *HappyDB) EmptyBlock(height uint64) (Block, error) {
+func (db *HappyDB) MakeBlock(height uint64, mustEmpty bool) (Block, error) {
 	b := EmptyBlock(height)
 	return &b, nil
 }

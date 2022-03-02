@@ -22,20 +22,20 @@ func (hs *HotStuff) loop() {
 		case proposal := <-hs.proposeCh:
 
 			if !hs.isLeader(hs.height, hs.view) {
-				hs.conf.Logger.Errorf("proposer(%s) not in turn, height(%d) view(%d)", hs.conf.ProposerID, hs.height, hs.view)
+				hs.conf.Logger.Errorf("proposer(%d) tried to propose when not in turn, height(%d) view(%d)", hs.idx, hs.height, hs.view)
 				continue
 			}
-			if hs.view != 0 {
-				hs.conf.Logger.Errorf("proposal(%s) Propose not in view 0", hs.conf.ProposerID)
+			if !hs.conf.Promiscuous && hs.view != 0 {
+				hs.conf.Logger.Errorf("proposer(%d) tried to propose when not in view 0 in bivalent mode", hs.idx)
 				continue
 			}
 			switch {
 			case proposal.Height() < hs.height:
-				hs.conf.Logger.Errorf("proposal(%s) Propose height decrease, proposal.height=%d, hs.height=%d", hs.conf.ProposerID, proposal.Height(), hs.height)
+				hs.conf.Logger.Errorf("proposer(%d) proposal height decrease, proposal.height=%d, hs.height=%d", hs.idx, proposal.Height(), hs.height)
 				continue
 			case proposal.Height() == hs.height:
-				if hs.candidateBlk != nil {
-					hs.conf.Logger.Errorf("proposal(%s) Propose twice in the same height, last:%v, current:%v", hs.conf.ProposerID, hs.candidateBlk.Hash(), proposal.Hash())
+				if hs.hasVotedPrepare {
+					hs.conf.Logger.Errorf("proposer(%d) has voted prepare in the current height(%d) and view(%d), last:%v, current:%v", hs.idx, hs.height, hs.view, hs.candidateBlk.Hash(), proposal.Hash())
 					continue
 				}
 			case proposal.Height() > hs.height:
@@ -208,7 +208,7 @@ func (hs *HotStuff) relayPropose() {
 		return
 	}
 
-	blk, err := hs.store.EmptyBlock(hs.height)
+	blk, err := hs.store.MakeBlock(hs.height, !hs.conf.Promiscuous && hs.view > 0)
 	if err != nil {
 		hs.conf.Logger.Errorf("proposer %d EmptyBlock failed:%v", hs.idx, err)
 		return

@@ -60,6 +60,11 @@ func (hs *HotStuff) onProposal(blk Block, qc *QC) {
 	hs.p2p.Broadcast(prepareMsg)
 
 	hs.onRecvPrepareVote(hs.conf.ProposerID, hs.idx, prepareMsg)
+
+	if hs.relayTimer != nil {
+		hs.relayTimer.Stop()
+		hs.relayTimer = nil
+	}
 }
 
 func (hs *HotStuff) onRecvPrepare(sender ID, idx int, msg *Msg) {
@@ -74,6 +79,11 @@ func (hs *HotStuff) onRecvPrepare(sender ID, idx int, msg *Msg) {
 		return
 	}
 
+	if !bytes.Equal(hs.store.SelectLeader(msg.Node.Blk.Height(), hs.view), sender) {
+		hs.conf.Logger.Errorf("proposer %s tried to propose when not in turn", sender)
+		return
+	}
+
 	if msg.Node.Blk.Height() != msg.Height {
 		hs.conf.Logger.Errorf("prepare block height(%d) != msg height(%d)", msg.Node.Blk.Height(), msg.Height)
 		return
@@ -83,17 +93,14 @@ func (hs *HotStuff) onRecvPrepare(sender ID, idx int, msg *Msg) {
 		return
 	}
 
-	switch {
-	case msg.View == 0:
-		if !msg.Node.Blk.Empty() && !bytes.Equal(hs.store.SelectLeader(msg.Node.Blk.Height(), 0), sender) {
-			hs.conf.Logger.Errorf("proposer %s tried to propose when not in turn", sender)
-			return
+	if msg.View > 0 {
+		if !hs.conf.Promiscuous {
+			if !msg.Node.Blk.Empty() && msg.Justify == nil {
+				hs.conf.Logger.Errorf("proposer %s tried to relay propose with no qc when in bivalent mode", sender)
+				return
+			}
 		}
-	case msg.View > 0:
-		if !msg.Node.Blk.Empty() && msg.Justify == nil {
-			hs.conf.Logger.Errorf("proposer %s tried to relay propose with no qc", sender)
-			return
-		}
+
 		if msg.Justify != nil {
 			err := msg.Justify.validate(hs)
 			if err != nil {
